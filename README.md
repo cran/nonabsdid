@@ -6,15 +6,19 @@
 [![Lifecycle: experimental](https://img.shields.io/badge/lifecycle-experimental-orange.svg)](https://lifecycle.r-lib.org/articles/stages.html#experimental)
 <!-- badges: end -->
 
-`nonabsdid` is an R package for visualizing and comparing heterogeneity-robust staggered DID event-study estimates under <ins>**non-absorbing**</ins> binary treatment. Its example output plot is as follows.
+`nonabsdid` is an R package for visualizing and comparing heterogeneity-robust staggered DID event-study estimates under <ins>**non-absorbing**</ins> binary treatment, where treatment status may switch on and off over time, including treatment reversals. Its example output event-study plot is as follows.
 
-![Comparison of heterogeneity-robust estimators vs naive TWFE](man/figures/README_example2_plot_method_shape.png)
+<img src="man/figures/README_example2_plot_method_shape.png" alt="Comparison of heterogeneity-robust estimators vs naive TWFE" />
 
-It covers existing multiple estimators and runs analysis via their
+This package can also produce a cohort-by-time "effect matrix" output as a heatmap so that you can read an estimator's heterogeneity. It supports DCDH and fect (IFE/MC/FE).  
+
+<img src="man/figures/README_cohort_matrix_combined.png" alt="DCDH vs fect cohort effect matrix" />
+
+## Supported estimators
+
+This package covers existing multiple estimators below and runs analysis via their
 own packages, then puts their output on the same time axis, the same
 tidy schema, and the same `ggplot2` panel so you can compare them at a glance.
-
-Supported estimators:
 
 - **DCDH** — de Chaisemartin & D'Haultfoeuille, via [`DIDmultiplegtDYN`](https://cran.r-project.org/package=DIDmultiplegtDYN).
 - **PanelMatch** — Imai, Kim, & Wang, via [`PanelMatch`](https://cran.r-project.org/package=PanelMatch).
@@ -38,6 +42,9 @@ correcting against.
 
 ## Installation
 
+> [!NOTE]
+> When the version on CRAN is outdated, install from GitHub or R-universe for the latest version.
+
 ```r
 # Development version from GitHub:
 # install.packages("pak")
@@ -59,10 +66,11 @@ plan to use.
 ## First-pass exploratory analysis
 
 At the early stage of an analysis, use `nabs_event_study_simple()` to get
-an initial sense of how the event-study estimates look across estimators.
-It runs the heterogeneity-robust estimators with reasonable defaults, fits
-a naive TWFE reference, and gives you a single overlay plot to inspect
-before moving on to estimator-specific tuning and robustness checks.
+an initial sense of how the event-study estimates look. By default it runs a
+deliberately cheap pass — DCDH plus two-way-FE imputation (`c("DCDH", "FE")`)
+and a naive TWFE reference — and on large panels it works on a random sample
+of units so the first look stays fast. The result is a single overlay plot to
+inspect before moving on to estimator-specific tuning.
 
 ```r
 library(nonabsdid)
@@ -78,7 +86,19 @@ res <- nabs_event_study_simple(
 res$plot       # the figure
 res$tidy       # combined tidy tibble across methods
 res$per_method # per-method tidy tibbles
-res$fits       # the native estimator objects, for diagnostics
+res$fits       # native estimator objects (only kept with keep_fits = TRUE)
+```
+
+Add the heavier estimators once the cheap pass looks reasonable — they are
+opt-in because PanelMatch's bootstrap and IFE/MC's cross-validation are slow
+on large panels:
+
+```r
+res <- nabs_event_study_simple(
+  mydata, outcome = "y", treatment = "d", unit = "id", time = "t",
+  methods = c("DCDH", "PanelMatch", "IFE", "FE", "MC"),
+  full = TRUE        # use every unit, not just the first-pass sample
+)
 ```
 
 If a particular estimator's package is not installed, that estimator is
@@ -135,7 +155,7 @@ through `nabs_event_study_simple()` via `...`.
 By default (`style = "prepost_color"`), each method gets its own color with
 separate shades for pre- and post-treatment periods:
 
-![Comparison of heterogeneity-robust estimators vs naive TWFE](man/figures/README_example_plot.png)
+<img src="man/figures/README_example_plot.png" alt="Comparison of heterogeneity-robust estimators vs naive TWFE" />
 
 
 ```r
@@ -146,7 +166,7 @@ With `style = "method_shape"`, color encodes the *method* only, and the
 pre/post distinction is carried by the marker shape (hollow circles for pre,
 filled triangles for post). This reads cleanly in grayscale:
 
-![Comparison of heterogeneity-robust estimators vs naive TWFE](man/figures/README_example_plot_method_shape.png)
+<img src="man/figures/README_example_plot_method_shape.png" alt="Comparison of heterogeneity-robust estimators vs naive TWFE" />
 
 
 ```r
@@ -158,8 +178,7 @@ Set `connect = TRUE` (works with either style) to join each series' point
 estimates with a thin line, drawn through the full path (pre and post are
 connected, including across the treatment boundary):
 
-![Comparison of heterogeneity-robust estimators vs naive TWFE](man/figures/README_example_plot_method_shape_connect.png)
-
+<img src="man/figures/README_example_plot_method_shape_connect.png" alt="Comparison of heterogeneity-robust estimators vs naive TWFE" />
 
 ```r
 nabs_event_plot(res_dcdh$tidy, res_pm$tidy, res_ife$tidy, reference = ref,
@@ -213,6 +232,93 @@ Anything coercible to a data frame with at least `time` and `estimate`
 columns also flows through `as_nabs_event_study()`. Adding a new estimator
 later means writing a one-line method that pulls the right slots — the
 plotting code keeps working.
+
+## Large panels and troubleshooting
+
+A few things are worth knowing before you point this at a big panel:
+
+- **DCDH needs `polars`.** The `DIDmultiplegtDYN` backend refers to the
+  `polars` package; nonabsdid attaches it for you (with a one-time note), but
+  it must be installed. If automatic loading fails, run `library(polars)`
+  once and retry.
+- **Unit / cluster ids are coerced automatically.** PanelMatch requires a
+  numeric unit id and DCDH's polars backend cannot cluster on a string, so a
+  non-numeric `unit` or `cluster` is replaced by integer codes (added as a new
+  column). This only relabels ids and never changes estimates.
+- **`fect` runs single-threaded by default.** For `IFE`/`FE`/`MC`,
+  `parallel = FALSE` is the default: on large panels, copying the data to
+  parallel workers tends to exhaust memory rather than help. Set
+  `parallel = TRUE` (optionally with `cores`) for small panels.
+- **Tuning knobs are first-class arguments.** `nabs_event_study()` accepts
+  `cv`, `nboots`, `r`, `parallel`, and `cores` for the `fect` family, and
+  `number.iterations` for PanelMatch's bootstrap. For the lightest IFE run,
+  for example, fix the factors and skip cross-validation with
+  `nabs_event_study(..., method = "IFE", cv = FALSE, r = 2, parallel = FALSE)`.
+- **Samples can differ across estimators.** DCDH, `fect`, and PanelMatch drop
+  missing rows differently, so a row with `NA` in a control may be used by one
+  method and not another; nonabsdid notes when partial missingness is present.
+
+## For Stata users
+
+`nonabsdid` ships Stata interoperability:
+
+``` r
+# Read a .dta directly (labelled columns and .a-.z missings handled),
+# or just pass the path straight to the wrappers:
+mydata <- nabs_read_dta("mypanel.dta")
+res    <- nabs_event_study_simple("mypanel.dta",
+                                  outcome = "y", treatment = "d",
+                                  unit = "id", time = "t")
+
+# Stata-style argument names from did_multiplegt_dyn are accepted and
+# translated with a message (group -> unit, effects -> leads, placebo -> lags):
+res <- nabs_event_study(mydata, outcome = "y", treatment = "d", time = "t",
+                        method = "DCDH",
+                        group = "id", effects = 8, placebo = 6)
+
+# Write the tidy estimates back out for a Stata-using coauthor:
+nabs_write_dta(res$tidy, "event_study_results.dta")
+```
+
+See `vignette("nonabsdid-for-stata-users")` for the full option-by-option
+mapping from `did_multiplegt_dyn` and the round trip back to `twoway`.
+
+## Cohort matrix
+
+The event-study workflow above collapses every cohort onto one relative-time
+axis. A separate feature line keeps the **onset cohort** as a second
+dimension and draws it as a heatmap — rows are cohorts, columns are relative (or
+calendar) time, fill is the estimated effect. One method per plot reads best
+(the method becomes the title); `show_se = TRUE` prints the standard error
+beneath each estimate.
+
+<img src="man/figures/README_cohort_matrix.png" alt="Cohort-by-time effect matrix heatmap (IFE estimator)" width="80%" />
+<img src="man/figures/README_cohort_matrix_dcdh.png" alt="Cohort-by-time effect matrix heatmap (DCDH estimator)" width="80%" />
+
+```r
+res_ife  <- nabs_effect_cells(panel, outcome = "y", treatment = "d",
+                              unit = "id", time = "t", method = "IFE")
+res_dcdh <- nabs_effect_cells(panel, outcome = "y", treatment = "d",
+                              unit = "id", time = "t", method = "DCDH")
+
+# individual heatmaps (recommended): auto-titled, estimates + SEs in each cell
+plot_effect_matrix(res_ife$cells,  show_estimates = TRUE, show_se = TRUE)
+plot_effect_matrix(res_dcdh$cells, show_estimates = TRUE, show_se = TRUE)
+
+# passing several methods facets them with a shared scale, but gets crowded:
+# plot_effect_matrix(res_dcdh$cells, res_ife$cells)
+```
+
+This currently supports **DCDH** and the **fect** family
+only. **PanelMatch is intentionally omitted**: a faithful cohort matrix needs
+per-cohort estimates *and* per-cohort SEs, and for PanelMatch that requires
+re-aggregating matched-set effects by switch time and re-running the matched-set
+bootstrap on that re-aggregation — out of scope for now, so it is left out
+rather than shipped with incorrect standard errors. Compare methods as
+triangulation of the *pattern*, not as cell-by-cell equality (the estimators
+differ in estimand, controls, and coverage). See the
+[*Cohort-by-time effect matrices and heatmaps*](https://takuma1102.github.io/nonabsdid/articles/cohort-matrix.html)
+article for more details.
 
 ## Status
 

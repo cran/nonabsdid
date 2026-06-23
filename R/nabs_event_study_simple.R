@@ -12,28 +12,47 @@
 #' the picture quickly*; for a careful, publication-ready result, switch
 #' to [nabs_event_study()] and tune options per estimator.
 #'
-#' @param data A panel data frame.
+#' @inheritParams nabs_event_study
 #' @param outcome,treatment,unit,time Character column names. The treatment
 #'   column should be a 0/1 indicator (it is allowed to switch back to 0,
 #'   i.e. non-absorbing).
 #' @param methods Character vector of estimators to run. Any subset of
-#'   `c("DCDH", "PanelMatch", "IFE", "FE", "MC")`. Default `c("DCDH",
-#'   "PanelMatch", "IFE")` -- the three classic heterogeneity-robust
-#'   estimators.
+#'   `c("DCDH", "PanelMatch", "IFE", "FE", "MC")`. Default `c("DCDH", "FE")`
+#'   -- a cheap first look (DCDH plus two-way-FE imputation, no
+#'   cross-validation). The heavier estimators (`PanelMatch`'s bootstrap and
+#'   `IFE`/`MC`'s cross-validation) are opt-in: add them explicitly once the
+#'   cheap pass looks reasonable, or call [nabs_event_study()] to tune them.
 #' @param include_twfe Logical; if `TRUE` (default), also fit a naive TWFE
 #'   reference series via [naive_twfe()] and overlay it in a neutral color.
 #' @param lags,leads Integer pre- and post-period lengths. If `NULL`
 #'   (default), reasonable values are auto-chosen from the panel: `leads`
-#'   is set to roughly one third of the longest post-treatment span
-#'   (capped at 8), and `lags` to roughly one quarter of the longest
-#'   pre-treatment span (capped at 6). Override either explicitly to be
+#'   is set to roughly one third of the typical (median) post-treatment
+#'   span across treated units (capped at 8), and `lags` to roughly one
+#'   quarter of the typical (median) pre-treatment span (capped at 6).
+#'   The median is used rather than the maximum so that a single unit with
+#'   an unusually long history does not inflate the window. Override either
+#'   explicitly to be
 #'   sure of the window.
 #' @param controls Optional character vector of covariate names; passed
 #'   straight through to each estimator.
 #' @param verbose Logical; if `TRUE` (default), print a brief progress
 #'   message before each estimator runs.
+#' @param full Logical; if `FALSE` (default) and the panel has more than
+#'   `max_units` units, a random sample of `max_units` units is used so the
+#'   first pass stays fast. Set `full = TRUE` to use every unit.
+#' @param max_units Integer; the unit cap used when `full = FALSE`
+#'   (default 5000).
+#' @param sample_seed Integer seed for the first-pass subsample, so the quick
+#'   look is reproducible. The caller's global RNG state is left untouched.
+#' @param keep_fits Logical; if `FALSE` (default) the heavy native estimator
+#'   objects are not retained in `$fits` (they can be gigabytes for `fect`).
+#'   Set `TRUE` if you need them for diagnostics.
 #' @param ... Forwarded to [nabs_event_plot()] (e.g. `xlim`, `ylim`,
-#'   `palette`, `ylab`, `x_break_by`).
+#'   `palette`, `ylab`, `x_break_by`). Stata-style aliases are also
+#'   accepted here and translated with an informative message: `df` (for
+#'   `data`), `group` (for `unit`), `placebo` (for `lags`), and `effects`
+#'   (for `leads`; note `leads = effects - 1`). See the "nonabsdid for
+#'   Stata users" vignette.
 #'
 #' @return A list of class `"nabs_event_study_simple"` with elements:
 #'   \describe{
@@ -84,13 +103,38 @@
 #' }
 #' @export
 nabs_event_study_simple <- function(data, outcome, treatment, unit, time,
-                                    methods = c("DCDH", "PanelMatch", "IFE"),
+                                    methods = c("DCDH", "FE"),
                                     include_twfe = TRUE,
                                     lags = NULL, leads = NULL,
                                     controls = NULL,
                                     verbose = TRUE,
+                                    full = FALSE,
+                                    max_units = 5000L,
+                                    sample_seed = 1L,
+                                    keep_fits = FALSE,
                                     ...) {
   call <- match.call()
+
+  # Stata-style aliases (df/group/effects/placebo) supplied through `...`
+  # are translated onto the canonical arguments; see translate_stata_dots().
+  st <- translate_stata_dots(
+    list(...),
+    have = list(
+      data  = !missing(data),
+      unit  = !missing(unit),
+      lags  = !is.null(lags),
+      leads = !is.null(leads)
+    ),
+    quiet = !isTRUE(verbose)
+  )
+  if (!is.null(st$values$data))  data  <- st$values$data
+  if (!is.null(st$values$unit))  unit  <- st$values$unit
+  if (!is.null(st$values$lags))  lags  <- st$values$lags
+  if (!is.null(st$values$leads)) leads <- st$values$leads
+  dots <- st$dots
+
+  # `data` may also be a path to a .dta file.
+  data <- resolve_panel_data(data)
 
   # Basic input check -- catches common mistakes early without requiring
   # any of the suggested packages to be installed.
@@ -109,6 +153,33 @@ nabs_event_study_simple <- function(data, outcome, treatment, unit, time,
   methods <- match.arg(methods,
                        choices = c("DCDH", "PanelMatch", "IFE", "FE", "MC"),
                        several.ok = TRUE)
+
+  # Keep the first pass fast on large panels by sampling units (reproducibly,
+  # without touching the caller's RNG). Opt out with `full = TRUE`.
+  units_all <- unique(data[[unit]])
+  n_units <- length(units_all)
+  if (!isTRUE(full) && n_units > max_units) {
+    keep <- with_local_seed(sample_seed, sample(units_all, max_units))
+    data <- data[data[[unit]] %in% keep, , drop = FALSE]
+    if (isTRUE(verbose)) {
+      cli::cli_alert_info(c(
+        "Large panel: using a {.val {max_units}}-of-{.val {n_units}} unit \\
+         sample for this first pass.",
+        "i" = "Pass {.code full = TRUE} to use every unit."
+      ))
+    }
+  }
+
+  # Validate / coerce once up front (numeric ids, 0/1 treatment, NA notice) so
+  # the per-method calls below see a clean panel and stay quiet.
+  pf <- preflight_panel(
+    data, outcome = outcome, treatment = treatment,
+    unit = unit, time = time, controls = controls, cluster = unit,
+    quiet = !isTRUE(verbose)
+  )
+  data     <- pf$data
+  unit     <- pf$unit
+  controls <- pf$controls
 
   # Auto-pick window lengths if the user didn't supply them. We look at the
   # actual treated history per unit to size the window sensibly.
@@ -174,7 +245,7 @@ nabs_event_study_simple <- function(data, outcome, treatment, unit, time,
     }
 
     if (!is.null(res)) {
-      fits[[m]]       <- res$fit
+      if (isTRUE(keep_fits)) fits[[m]] <- res$fit
       per_method[[m]] <- res$tidy
     }
   }
@@ -211,9 +282,10 @@ nabs_event_study_simple <- function(data, outcome, treatment, unit, time,
 
   combined <- bind_event_studies(per_method)
 
-  plot <- nabs_event_plot(per_method,
-                          reference = twfe,
-                          ...)
+  plot <- do.call(
+    nabs_event_plot,
+    c(list(per_method, reference = twfe), dots)
+  )
 
   structure(
     list(
@@ -234,8 +306,13 @@ print.nabs_event_study_simple <- function(x, ...) {
   cli::cli_text("methods run: {.val {names(x$per_method)}}")
   cli::cli_text("twfe reference: {.val {!is.null(x$twfe)}}")
   cli::cli_text("rows in combined tidy: {nrow(x$tidy)}")
-  cli::cli_text("Use {.code $plot} to view, {.code $tidy} to inspect, \\
-                  {.code $fits} for native objects.")
+  if (length(x$fits)) {
+    cli::cli_text("Use {.code $plot} to view, {.code $tidy} to inspect, \\
+                    {.code $fits} for native objects.")
+  } else {
+    cli::cli_text("Use {.code $plot} to view and {.code $tidy} to inspect \\
+                    (re-run with {.code keep_fits = TRUE} for native objects).")
+  }
   invisible(x)
 }
 
@@ -257,14 +334,12 @@ auto_window <- function(data, treatment, unit, time,
     return(list(lags = as.integer(user_lags), leads = as.integer(user_leads)))
   }
 
-  d <- data.frame(
-    unit = data[[unit]],
-    t    = as.numeric(data[[time]]),
-    z    = as.integer(data[[treatment]] != 0L)
-  )
-  treated_rows <- d[d$z == 1L & !is.na(d$z), , drop = FALSE]
+  u <- data[[unit]]
+  t <- as.numeric(data[[time]])
+  z <- as.integer(data[[treatment]] != 0L)
+  treated <- !is.na(z) & z == 1L
 
-  if (nrow(treated_rows) == 0L) {
+  if (!any(treated)) {
     cli::cli_warn(c(
       "No treated observations found in {.arg data}.",
       "i" = "Falling back to lags = 6, leads = 8."
@@ -272,18 +347,20 @@ auto_window <- function(data, treatment, unit, time,
     return(list(lags = 6L, leads = 8L))
   }
 
-  # Pre-treatment span: longest stretch from earliest observation to first
-  # switch-on, across treated units.
-  first_treat <- stats::aggregate(t ~ unit, data = treated_rows, FUN = min)
-  names(first_treat) <- c("unit", "first_t")
-  unit_min <- stats::aggregate(t ~ unit, data = d, FUN = min)
-  names(unit_min) <- c("unit", "min_t")
-  unit_max <- stats::aggregate(t ~ unit, data = d, FUN = max)
-  names(unit_max) <- c("unit", "max_t")
-  m <- merge(merge(first_treat, unit_min, by = "unit"), unit_max, by = "unit")
+  # Per-unit reductions in a single grouped pass each, keyed on integer unit
+  # codes. This drops the formula-interface aggregate() calls and the
+  # merge() sort-joins, which dominate auto_window() on large panels.
+  g <- match(u, unique(u))                       # 1..U unit codes
+  unit_min <- tapply(t, g, min)                  # earliest period per unit
+  unit_max <- tapply(t, g, max)                  # latest period per unit
+  first_t  <- tapply(t[treated], g[treated], min) # first switch-on per treated unit
 
-  pre_span  <- max(m$first_t - m$min_t, na.rm = TRUE)
-  post_span <- max(m$max_t   - m$first_t, na.rm = TRUE)
+  # Align spans to treated units only (tapply keys are the unit codes). Use the
+  # median span across treated units rather than the max, so a single unit with
+  # an unusually long pre/post history can't inflate the default window.
+  gt <- names(first_t)
+  pre_span  <- stats::median(first_t - unit_min[gt], na.rm = TRUE)
+  post_span <- stats::median(unit_max[gt] - first_t, na.rm = TRUE)
 
   default_lags  <- if (is.null(user_lags))  {
     max(2L, min(6L, as.integer(round(pre_span  / 4))))

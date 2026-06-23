@@ -1,7 +1,7 @@
-# nonabsdid 0.3.2
+# nonabsdid 0.4.1
 
-* Initial CRAN release.
-* Supports DCDH, PanelMatch, and fect (IFE/FE/MC) event-study estimators
-  with a unified interface and tidy output schema.
-* Provides `nabs_event_plot()` for overlaying estimates across methods,
-  with an optional naive TWFE reference series.
+* Sped up PanelMatch and the fect family (IFE / MC) on large panels.
+* Made estimators more robust on large, real-world panels.
+* Added a `pkgdown` website.
+* Added a cohort-based heatmap function.
+* Added Stata interoperability. 
